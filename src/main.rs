@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::{
     error::Error,
-    io,
+    io::{self, Stdout},
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc,
@@ -9,7 +9,12 @@ use std::{
     thread,
     time::Duration,
 };
-use termion::{event::Key, input::TermRead, raw::IntoRawMode, screen::AlternateScreen};
+use termion::{
+    event::Key,
+    input::TermRead,
+    raw::{IntoRawMode, RawTerminal},
+    screen::AlternateScreen,
+};
 use tui::{
     backend::{Backend, TermionBackend},
     layout::{Alignment, Constraint, Direction, Layout},
@@ -47,31 +52,104 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stdout = AlternateScreen::from(stdout);
     let backend = TermionBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
     let mut app = App::new(args);
 
+    key_events_loop(&mut terminal, &mut app).unwrap();
+    Ok(())
+}
+
+fn key_events_loop(
+    mut terminal: &mut Terminal<TermionBackend<AlternateScreen<RawTerminal<Stdout>>>>,
+    mut app: &mut App,
+) -> Result<(), Box<dyn Error>> {
     let events = key_events();
     loop {
         terminal.draw(|f| draw(f, &mut app).unwrap()).unwrap();
         match events.recv()? {
-            key => match key {
+            TimrEvent::Input(key) => match key {
                 Key::Char('\n') => {
-                    thread::spawn(move || loop {
-                        if app.duration.load(Ordering::SeqCst) == 0 {
-                            break;
-                        }
-                        terminal.draw(|f| draw(f, &mut app).unwrap()).unwrap();
-                        thread::sleep(Duration::from_secs(1));
-                        app.duration.fetch_sub(1, Ordering::Relaxed); //atomic version of -=1 for a counter
-                    });
+                    all_events_loop(&mut terminal, &mut app).unwrap();
+                    return Ok(());
                 }
-                Key::Char('q') => {
+                Key::Esc => {
+                    return Ok(());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn all_events_loop(
+    terminal: &mut Terminal<TermionBackend<AlternateScreen<RawTerminal<Stdout>>>>,
+    mut app: &mut App,
+) -> Result<(), Box<dyn Error>> {
+    let events = all_events();
+    loop {
+        terminal.draw(|f| draw(f, &mut app).unwrap()).unwrap();
+        match events.recv()? {
+            TimrEvent::Tick => {
+                if app.duration.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                app.duration.fetch_sub(1, Ordering::Relaxed); //atomic version of -=1 for a counter
+            }
+            TimrEvent::Input(key) => match key {
+                Key::Esc => {
                     return Ok(());
                 }
                 _ => {}
             },
         }
     }
+    return Ok(());
+}
+
+enum TimrEvent {
+    Input(Key),
+    Tick,
+}
+
+fn all_events() -> mpsc::Receiver<TimrEvent> {
+    let (tx, rx) = mpsc::channel();
+    let key_tx = tx.clone();
+
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for key in stdin.keys().flatten() {
+            if let Err(err) = key_tx.send(TimrEvent::Input(key)) {
+                eprintln!("{}", err);
+                return;
+            }
+        }
+    });
+
+    thread::spawn(move || loop {
+        if let Err(err) = tx.send(TimrEvent::Tick) {
+            eprintln!("{}", err);
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    });
+
+    rx
+}
+
+fn key_events() -> mpsc::Receiver<TimrEvent> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for key in stdin.keys().flatten() {
+            if let Err(err) = tx.send(TimrEvent::Input(key)) {
+                eprintln!("{}", err);
+                return;
+            }
+        }
+    });
+
+    rx
 }
 
 fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<(), ()> {
@@ -101,20 +179,4 @@ fn draw<B: Backend>(f: &mut Frame<B>, app: &mut App) -> Result<(), ()> {
     );
 
     Ok(())
-}
-
-fn key_events() -> mpsc::Receiver<Key> {
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for key in stdin.keys().flatten() {
-            if let Err(err) = tx.send(key) {
-                eprintln!("{}", err);
-                return;
-            }
-        }
-    });
-
-    rx
 }
